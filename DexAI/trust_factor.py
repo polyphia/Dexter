@@ -111,10 +111,11 @@ class Analyzer:
 
     def _is_successful_mint(self, token_info):
         """
-        Determine if a mint is successful based on criteria:
+        Determine if a mint is successful or a fast rug based on criteria:
         0. Sniping price = Price closest to X second after the first transaction.
         1. Highest price at least 150% of sniping price.
         2. The highest price was reached after at least 25 swaps.
+        3. Fast rug: Price drops >= 40% in 3 seconds.
         """
         price_history = token_info["price_history"]
         if not price_history:
@@ -127,9 +128,30 @@ class Analyzer:
         if not timestamps or not prices:
             return False, 0
 
+        # Check for fast rug (RUG_DROP_THRESHOLD SETS % of PRICE DROP TO CONSIDER RUG)
+        RUG_DROP_THRESHOLD = Decimal("0.50") #50% PRICE DROP
+        # INTERVAL TO CONSIDER PRICE DROP FOR DETECTING AS RUG
+        RUG_TIME_WINDOW = 3.0
+
+        for i in range(len(timestamps)):
+            start_time = float(timestamps[i])
+            start_price = prices[i]
+            
+            for j in range(i + 1, len(timestamps)):
+                end_time = float(timestamps[j])
+                end_price = prices[j]
+                
+                if end_time - start_time > RUG_TIME_WINDOW:
+                    break
+
+                price_drop_pct = (start_price - end_price) / start_price
+                if price_drop_pct >= RUG_DROP_THRESHOLD:
+                    # Flag as a rug
+                    return False, 0
+
         # 0: Calculate the sniping price
         first_timestamp = float(timestamps[0])
-        target_timestamp = first_timestamp + SNIPING_PRICE_TIME  # 1 second after the first transaction
+        target_timestamp = first_timestamp + SNIPING_PRICE_TIME
 
         # Find the closest timestamp to the target
         closest_index = min(range(len(timestamps)), key=lambda i: abs(float(timestamps[i]) - target_timestamp))
@@ -153,89 +175,6 @@ class Analyzer:
         ratio = float((peak_price - sniping_price) / sniping_price) * 100
 
         return True, ratio
-
-    def analyze_top_creators_sync(self, data):
-        """
-        Incrementally analyzes creators and updates metrics.
-        """
-        # Gather data for creators from the chunk
-        creator_data = defaultdict(list)
-
-        for record in data:
-            price_history = record["price_history"]
-            ohlc = record["final_ohlc"] if record["final_ohlc"] else {}
-            peak_price = ohlc.get("high", 0) if ohlc else 0
-            peak_market_cap = record["peak_market_cap"] if record["peak_market_cap"] else 0
-            peak_price_change = record["peak_price_change"] if record["peak_price_change"] else 0
-
-            token_info = {
-                "mint": record["mint_id"],
-                "name": record["name"],
-                "symbol": record["symbol"],
-                "peak_price_change": peak_price_change,
-                "peak_market_cap": peak_market_cap,
-                "final_market_cap": record["final_market_cap"],
-                "open_price": ohlc.get("open", 0) if ohlc else 0,
-                "high_price": peak_price,
-                "low_price": ohlc.get("low", 0) if ohlc else 0,
-                "current_price": ohlc.get("close", 0) if ohlc else 0,
-                "swaps": record["tx_counts"],
-                "volume": record["volume"],
-                "holders": record["holders"],
-                "creation_time": record["creation_time"],
-                "price_history": price_history,
-            }
-            creator = record.get("owner", "unknown")
-
-            # Skip already processed mints
-            if record['mint_id'] in self.seen_mints:
-                continue
-
-            creator_data[creator].append(token_info)
-            self.seen_mints.add(record['mint_id'])
-
-        # Merge chunk data with existing `top_creators` and update metrics
-        for creator, new_tokens in creator_data.items():
-            if creator not in self.top_creators:
-                self.top_creators[creator] = {"tokens": []}
-
-            # Append new tokens to the existing token list
-            self.top_creators[creator]["tokens"].extend(new_tokens)
-
-            # Update metrics for the creator
-            all_tokens = self.top_creators[creator]["tokens"]
-            peak_market_caps = [t["peak_market_cap"] for t in all_tokens if t["peak_market_cap"]]
-            median_peak_market_cap = self._calculate_median(peak_market_caps)
-            peak_prices = [t["high_price"] for t in all_tokens if t["high_price"]]
-            median_peak_price = self._calculate_median(peak_prices)
-            current_prices = [t["current_price"] for t in all_tokens if t["current_price"]]
-            median_current_price = self._calculate_median(current_prices)
-            open_prices = [t["open_price"] for t in all_tokens if t["open_price"]]
-            median_open_price = self._calculate_median(open_prices)
-            final_market_caps = [t["final_market_cap"] for t in all_tokens if t["final_market_cap"]]
-            median_market_caps = self._calculate_median(final_market_caps)
-
-            creation_times = [float(t["creation_time"].split('.')[0]) for t in all_tokens if t["creation_time"]]
-            creation_times.sort()
-            creation_delays = []
-            for i in range(1, len(creation_times)):
-                delay = creation_times[i] - creation_times[i - 1]
-                creation_delays.append(delay)
-
-            total_swaps = sum(t["swaps"].get("swaps", 0) for t in all_tokens)
-
-            # Update the top creator entry with recalculated metrics
-            self.top_creators[creator].update({
-                "creator": creator,
-                "mint_count": len(all_tokens),
-                "median_open_price": median_open_price,
-                "median_peak_market_cap": median_peak_market_cap,
-                "median_peak_price": median_peak_price,
-                "median_current_prices": median_current_price,
-                "median_market_cap": median_market_caps,
-                "creation_delays": creation_delays,
-                "total_swaps": total_swaps,
-            })
 
     def process_results_sync(self, show_result=True):
         return self.process_results(show_result=show_result)
